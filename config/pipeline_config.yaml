@@ -31,6 +31,49 @@ data_quality:
   enabled: true
   checks_path: "/opt/airflow/soda/checks.yml"
 
+# Configurable row-level cleaning (src/cleaning.py), applied per dataset
+# before the warehouse write. Rule execution order is fixed in code
+# (hash -> null -> cast -> range -> dedup) and ignores YAML key order.
+# Remove this whole section to fall back to passthrough (legacy behaviour).
+cleaning:
+  datasets:
+    sales:
+      dedup:
+        keys: ["transaction_id"]
+        # Explicit policy when a key column is absent from the data:
+        #   fail - hard stop (duplicate orders must never reach the table)
+        #   hash - degrade to whole-row hash dedup (hash taken pre-cast)
+        on_missing_keys: "fail"
+      null_policy:
+        transaction_id: "reject"
+        customer_id: "reject"
+        product_id: "reject"
+        quantity: "reject"
+        total_amount: "reject"
+        transaction_timestamp: "reject"
+      casts:
+        - column: "customer_id"
+          type: "int64"
+        - column: "product_id"
+          type: "int64"
+        - column: "quantity"
+          type: "int64"
+        - column: "total_amount"
+          type: "float64"
+        - column: "transaction_timestamp"
+          type: "timestamp"
+      ranges:
+        - column: "total_amount"
+          min: 0
+          min_strict: true   # bound excluded: zero/negative amounts are quarantined
+          action: "reject"
+        - column: "quantity"
+          min: 1
+          action: "reject"
+        - column: "product_id"
+          min: 1
+          action: "reject"
+
 observability:
   metrics_enabled: true
   job_name: "sales_pipeline"

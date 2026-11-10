@@ -1,13 +1,17 @@
 """Silver layer: Cleaned and deduplicated data in Delta Lake."""
+import io
 from datetime import datetime
 from typing import Dict, Any, Optional
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 from deltalake import DeltaTable, write_deltalake
 from deltalake.exceptions import TableNotFoundError
 
 from src.processors.base_processor import BaseProcessor
+from src.cleaning import DataCleaner, build_cleaner
 from src.utils.database import DuckDBClient
+from src.utils.metrics import track_cleaning_hits
 from src.config import get_config
 
 
@@ -29,19 +33,29 @@ class SilverProcessor(BaseProcessor):
             f"silver={self.silver_bucket}"
         )
     
-    def process(self, bronze_key: str, **kwargs) -> Dict[str, Any]:
+    def process(
+        self,
+        bronze_key: str,
+        cleaner: Optional[DataCleaner] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """
         Process Bronze data to Silver Delta table.
-        
+
         Args:
             bronze_key: S3 key of the Bronze data file
-        
+            cleaner: optional configured DataCleaner. When provided the raw
+                rows are cleaned/quarantined by the configurable operator;
+                when None the legacy SQL filtering path is used unchanged.
+
         Returns:
             {
                 "records_read": int,
                 "records_cleaned": int,
                 "records_written": int,
                 "duplicates_removed": int,
+                "quarantined_records": int,
+                "rule_hits": dict,
                 "status": "success"
             }
         """
@@ -49,10 +63,31 @@ class SilverProcessor(BaseProcessor):
             date_partition = datetime.utcnow().strftime("%Y-%m-%d")
             bronze_path = f"s3://{self.bronze_bucket}/{bronze_key}"
 
-            with DuckDBClient() as conn:
-                arrow_table = conn.execute(f"""
-                    WITH raw_data AS (
-                        SELECT
+            # Two distinct reads:
+            # - cleaning mode: project RAW columns with no SQL cast/filter, so
+            #   dirty values (bad dates, non-numeric strings, negatives) reach
+            #   the operator and get charged to the correct rule. Casting here
+            #   would either hard-fail the whole batch or turn a cast failure
+            #   into a NULL, mis-attributing it to the null rule.
+            # - passthrough mode: legacy query (cast + WHERE) unchanged.
+            if cleaner is not None:
+                projection = """
+                            CAST(transaction_id AS VARCHAR) AS transaction_id,
+                            customer_id,
+                            product_id,
+                            quantity,
+                            unit_price,
+                            total_amount,
+                            transaction_timestamp,
+                            payment_method,
+                            CAST(store_id AS BIGINT) AS store_id,
+                            status,
+                            '{date_partition}' as partition_date,
+                            CURRENT_TIMESTAMP as processed_at
+                """.format(date_partition=date_partition)
+                cleaning_where = ""
+            else:
+                projection = """
                             CAST(transaction_id AS VARCHAR) AS transaction_id,
                             CAST(customer_id AS BIGINT) AS customer_id,
                             CAST(product_id AS BIGINT) AS product_id,
@@ -65,49 +100,74 @@ class SilverProcessor(BaseProcessor):
                             status,
                             '{date_partition}' as partition_date,
                             CURRENT_TIMESTAMP as processed_at
-                        FROM read_json_auto('{bronze_path}')
-                    ),
-                    cleaned_data AS (
-                        SELECT *
-                        FROM raw_data
-                        WHERE 
+                """.format(date_partition=date_partition)
+                cleaning_where = """
+                        WHERE
                             -- Remove nulls in required fields
                             transaction_id IS NOT NULL
                             AND customer_id IS NOT NULL
                             AND product_id IS NOT NULL
                             AND transaction_timestamp IS NOT NULL
-                            
+
                             -- Remove future timestamps
                             AND transaction_timestamp <= CURRENT_TIMESTAMP
-                            
+
                             -- Remove zero/negative quantities
                             AND quantity > 0
-                            
+
                             -- Remove negative amounts
                             AND total_amount > 0
-                            
+
                             -- Remove mismatched totals (0.01 tolerance)
                             AND ABS(total_amount - (quantity * unit_price)) <= 0.01
-                            
+
                             -- Valid payment methods
                             AND payment_method IN ('credit_card', 'debit_card', 'cash', 'digital_wallet')
-                            
+
                             -- Valid statuses
                             AND status IN ('completed', 'pending', 'cancelled')
-                            
+
                             -- Valid product ID range
-                            AND product_id > 0 
-                            AND product_id <= {self.num_products}
+                            AND product_id > 0
+                            AND product_id <= {num_products}
+                """.format(num_products=self.num_products)
+
+            with DuckDBClient() as conn:
+                arrow_table = conn.execute(f"""
+                    WITH raw_data AS (
+                        SELECT
+                            {projection}
+                        FROM read_json_auto('{bronze_path}')
+                    ),
+                    cleaned_data AS (
+                        SELECT *
+                        FROM raw_data
+                        {cleaning_where}
                     )
                     SELECT * FROM cleaned_data
                 """).arrow()
 
             records_read = arrow_table.num_rows
-            records_cleaned = records_read
+            quarantined_records = 0
+            rule_hits: Dict[str, int] = {}
+
+            if cleaner is not None:
+                cleaning_result = cleaner.clean(arrow_table)
+                arrow_table = cleaning_result.cleaned
+                quarantined_records = cleaning_result.quarantined.num_rows
+                rule_hits = cleaning_result.rule_hits
+
+                # Per-batch quarantine, overwrite (same batch key => same
+                # object key), so a retry replay never appends duplicates.
+                self._write_quarantine(cleaning_result.quarantined, bronze_key)
+                track_cleaning_hits('sales', rule_hits)
+
+            records_cleaned = arrow_table.num_rows
 
             self.logger.info(
                 f"✓ Cleaned data: {records_read} → {records_cleaned} records "
-                f"({records_read - records_cleaned} removed)"
+                f"({records_read - records_cleaned} removed, "
+                f"{quarantined_records} quarantined)"
             )
 
             silver_path = f"s3://{self.silver_bucket}/sales"
@@ -135,6 +195,8 @@ class SilverProcessor(BaseProcessor):
                 "records_cleaned": records_cleaned,
                 "records_written": records_written,
                 "duplicates_removed": duplicates_removed,
+                "quarantined_records": quarantined_records,
+                "rule_hits": rule_hits,
                 "partition_date": date_partition,
                 "status": "success"
             }
@@ -199,6 +261,30 @@ class SilverProcessor(BaseProcessor):
             )
             raise
     
+    def _write_quarantine(self, quarantined: pa.Table, bronze_key: str) -> str:
+        """
+        Write quarantined rows for one batch, overwriting any prior attempt.
+
+        The object key is derived deterministically from the Bronze batch key,
+        so an Airflow retry of the same batch replaces the previous quarantine
+        object instead of appending a second copy.
+        """
+        batch_id = bronze_key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        quarantine_key = f"quarantine/sales/{batch_id}.parquet"
+
+        buffer = io.BytesIO()
+        pq.write_table(quarantined, buffer)
+        self.storage.client.put_object(
+            Bucket=self.silver_bucket,
+            Key=quarantine_key,
+            Body=buffer.getvalue(),
+        )
+        self.logger.info(
+            f"✓ Quarantined {quarantined.num_rows} records → "
+            f"s3://{self.silver_bucket}/{quarantine_key} (batch overwrite)"
+        )
+        return quarantine_key
+
     def _write_to_delta(self, arrow_table: pa.Table, silver_path: str) -> None:  # ✅ CHANGED: Accept Arrow
         """
         Write Arrow Table to Delta Lake using APPEND mode.

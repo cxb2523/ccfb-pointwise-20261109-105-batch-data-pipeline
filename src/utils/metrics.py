@@ -45,6 +45,13 @@ TASK_STATUS = Counter(
     registry=registry
 )
 
+CLEANING_RULE_HITS = Counter(
+    'pipeline_cleaning_rule_hits_total',
+    'Rows charged to each cleaning rule (first hit wins)',
+    ['dataset', 'rule'],
+    registry=registry
+)
+
 
 def push_metrics(grouping_key: Optional[dict] = None):
     """Push metrics to Pushgateway with optional grouping key.
@@ -94,3 +101,22 @@ def track_table_size(table_name: str, row_count: int):
     logger.info(f"Table {table_name} has {row_count} rows")
 
     push_metrics()
+
+
+def track_cleaning_hits(dataset: str, rule_hits: dict):
+    """Record how many rows each cleaning rule charged (statsd-ready).
+
+    rule_hits maps rule label (e.g. ``range:total_amount``, ``dedup``) to the
+    number of rows attributed to it. Push failures must never fail the run.
+    """
+    if not rule_hits:
+        return
+    try:
+        for rule, count in rule_hits.items():
+            CLEANING_RULE_HITS.labels(dataset=dataset, rule=rule).inc(count)
+            logger.info(
+                f"Cleaning rule hit: dataset={dataset} rule={rule} rows={count}"
+            )
+        push_metrics(grouping_key={'layer': 'silver', 'table': 'sales_cleaning'})
+    except Exception as e:
+        logger.error(f"Failed to record cleaning metrics: {e}", exc_info=True)

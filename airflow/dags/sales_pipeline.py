@@ -22,6 +22,7 @@ from airflow.models import DagRun
 sys.path.insert(0, '/opt/airflow')
 
 from src.config import get_config
+from src.cleaning import build_cleaner
 from src.processors.bronze_processor import BronzeProcessor
 from src.processors.silver_processor import SilverProcessor
 from src.processors.gold_processor import GoldProcessor
@@ -147,36 +148,52 @@ def sales_delta_pipeline():
     )
     def process_to_silver(bronze_result: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Process Bronze → Silver with cleaning and deduplication.
-        
+        Process Bronze → Silver with configurable cleaning and deduplication.
+
+        The cleaner is built from the ``cleaning`` config section. When the
+        section is absent build_cleaner() returns None and SilverProcessor
+        runs its legacy filtering path unchanged (passthrough).
+
         Args:
             bronze_result: Output from ingest_sales_data task
-        
+
         Returns:
             {
                 "records_read": int,
                 "records_cleaned": int,
                 "records_written": int,
                 "duplicates_removed": int,
+                "quarantined_records": int,
+                "rule_hits": dict,
                 "status": "success"
             }
         """
         try:
             bronze_key = bronze_result['key']
-            
+
+            cleaner = build_cleaner('sales')
+            if cleaner is None:
+                logger.info(
+                    "No cleaning config for dataset 'sales'; legacy "
+                    "passthrough cleaning path"
+                )
+
             processor = SilverProcessor()
-            result = processor.process(bronze_key=bronze_key)
-            
+            result = processor.process(bronze_key=bronze_key, cleaner=cleaner)
+
             logger.info(
                 f"✓ Silver processing complete: "
                 f"{result['records_read']} read → "
                 f"{result['records_cleaned']} cleaned → "
                 f"{result['records_written']} written "
-                f"({result['duplicates_removed']} duplicates removed)"
+                f"({result['duplicates_removed']} duplicates removed, "
+                f"{result.get('quarantined_records', 0)} quarantined)"
             )
-            
+            for rule, hits in result.get('rule_hits', {}).items():
+                logger.info(f"cleaning rule hit: {rule}={hits} rows")
+
             return result
-            
+
         except Exception as e:
             logger.error(f"Silver processing failed: {e}")
             raise
