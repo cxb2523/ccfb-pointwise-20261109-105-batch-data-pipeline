@@ -1,0 +1,22 @@
+# Ignore data folders
+data/
+
+# Ignore Airflow files
+airflow/logs/
+plugins/
+logs/
+airflow.cfg
+
+# Ignore Python virtual environment
+venv/
+.env
+
+# Ignore IDE-specific files
+.idea/
+.vscode/
+
+# Ignore Python compiled files
+__pycache__/
+*.pyc
+
+plugins/
