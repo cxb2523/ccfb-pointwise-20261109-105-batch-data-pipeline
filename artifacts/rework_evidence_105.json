@@ -1,0 +1,17 @@
+{
+  "uid": "64",
+  "session_id": "c8d7b500-23de-41b5-8add-1db3be7957ad",
+  "model": "auto_model/urm",
+  "context_window": 1000000,
+  "stream_file": "run_logs/claude_run_105.stream.jsonl",
+  "stream_sha256": "7ba4004d824396e14e0f50aae1011584d9c2546982653e782d4492ba007451ec",
+  "raw_context_excerpt": "annotation_state/rework_context_raw_105.jsonl",
+  "same_session_cwd": "D:\\gsb-auto\\batches\\pointwise-20261109\\105-batch-data-pipeline\\A",
+  "same_session_cli_version": "2.1.239",
+  "current_host_platform": "Windows-11-10.0.26300-SP0",
+  "evidence_basis": [
+    "Final stream modelUsage records contextWindow=1000000.",
+    "Raw session metadata records the same session cwd and CLI version.",
+    "The Windows drive-path cwd and current recorder host both identify Windows."
+  ]
+}
